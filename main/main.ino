@@ -3,6 +3,12 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
+struct Medicao {
+  int   bateria;
+  float tensao;
+  float corrente;
+};
+
 // ─── WiFi Access Point ───────────────────────────────────────────────────────
 const char* AP_SSID     = "BMS-ESP32";
 const char* AP_PASSWORD = "12345678";
@@ -18,8 +24,8 @@ INA219* sensores[] = {&INA1, &INA2, &INA3};
 const char* nomes[] = {"Bateria 1", "Bateria 2", "Bateria 3"};
 
 // ─── Pinos ───────────────────────────────────────────────────────────────────
-const int PINO_RELE[3]  = {25, 26, 27};
-const int PINO_MOSFET   = 33;
+const int PINO_RELE[3]   = {25, 26, 27};
+const int PINO_MOSFET    = 33;
 const int PINO_TERMISTOR = 34;
 
 // ─── Limites BMS ─────────────────────────────────────────────────────────────
@@ -29,15 +35,41 @@ const float CORRENTE_MAX = 2000;
 const float TEMP_MAX     = 60.0;
 const float DELTA_BAL    = 0.05;
 
-// ─── Estado global ───────────────────────────────────────────────────────────
-struct Medicao {
-  int   bateria;
-  float tensao;
-  float corrente;
-};
+// ─── SoC ─────────────────────────────────────────────────────────────────────
+const float CAPACIDADE_MAH = 3600.0; // 3x 1200mAh
+float soc = 100.0;                   // % inicial
+unsigned long ultimoTempoSoC = 0;
 
+// tabela OCV para calibração inicial (tensão média por célula)
+float ocvPorSoC[][2] = {
+  {4.20, 100}, {4.00, 80}, {3.80, 60},
+  {3.60, 40},  {3.40, 20}, {3.20,  5}, {3.00, 0}
+};
+const int N_OCV = 7;
+
+float tensaoParaSoC(float v) {
+  if (v >= ocvPorSoC[0][0])       return 100.0;
+  if (v <= ocvPorSoC[N_OCV-1][0]) return 0.0;
+  for (int i = 0; i < N_OCV - 1; i++) {
+    if (v <= ocvPorSoC[i][0] && v >= ocvPorSoC[i+1][0]) {
+      float t = (v - ocvPorSoC[i+1][0]) / (ocvPorSoC[i][0] - ocvPorSoC[i+1][0]);
+      return ocvPorSoC[i+1][1] + t * (ocvPorSoC[i][1] - ocvPorSoC[i+1][1]);
+    }
+  }
+  return 0.0;
+}
+
+void atualizarSoC(float correnteTotalMA) {
+  unsigned long agora = millis();
+  float dtHoras = (agora - ultimoTempoSoC) / 3600000.0;
+  ultimoTempoSoC = agora;
+  soc -= (correnteTotalMA * dtHoras / CAPACIDADE_MAH) * 100.0;
+  soc = constrain(soc, 0.0, 100.0);
+}
+
+// ─── Estado global ───────────────────────────────────────────────────────────
 Medicao leituras[3];
-float tempPack = 0;
+float tempPack    = 0;
 bool sistemaAtivo = true;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -110,8 +142,8 @@ void balancear() {
 // ════════════════════════════════════════════════════════════════════════════
 bool condicoesNormais() {
   for (int i = 0; i < 3; i++) {
-    if (leituras[i].tensao   > TENSAO_MAX)   return false;
-    if (leituras[i].tensao   < TENSAO_MIN)   return false;
+    if (leituras[i].tensao > TENSAO_MAX)          return false;
+    if (leituras[i].tensao < TENSAO_MIN)           return false;
     if (abs(leituras[i].corrente) > CORRENTE_MAX) return false;
   }
   if (tempPack > TEMP_MAX) return false;
@@ -149,10 +181,14 @@ void handleRoot() {
   *{box-sizing:border-box;}
   body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:12px;}
   h1{text-align:center;color:#4fc3f7;margin:8px 0;}
-  #status{text-align:center;font-size:1.1em;margin:6px 0;}
+  #status{text-align:center;font-size:1.1em;margin:4px 0;}
   .ok{color:#66bb6a;} .err{color:#ef5350;}
-  #temp{text-align:center;font-size:1em;color:#ffb74d;margin-bottom:10px;}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;max-width:860px;margin:auto;}
+  #temp{text-align:center;font-size:1em;color:#ffb74d;margin:4px 0;}
+  .soc-wrap{max-width:860px;margin:10px auto;background:#1e1e1e;border-radius:12px;padding:12px;}
+  .soc-label{display:flex;justify-content:space-between;font-size:.9em;color:#aaa;margin-bottom:6px;}
+  .soc-bar-bg{background:#333;border-radius:8px;height:22px;overflow:hidden;}
+  .soc-bar{height:100%;border-radius:8px;transition:width .5s,background .5s;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;max-width:860px;margin:10px auto 0;}
   .card{background:#1e1e1e;border-radius:12px;padding:12px;}
   .card h3{margin:0 0 8px;font-size:.95em;color:#aaa;text-align:center;}
   canvas{display:block;width:100%!important;}
@@ -162,10 +198,21 @@ void handleRoot() {
 <h1>BMS Dashboard</h1>
 <div id="status" class="ok">Sistema: ATIVO</div>
 <div id="temp">Temperatura do Pack: --°C</div>
+
+<div class="soc-wrap">
+  <div class="soc-label">
+    <span>Estado de Carga (SoC)</span>
+    <span id="socPct">--%</span>
+  </div>
+  <div class="soc-bar-bg">
+    <div class="soc-bar" id="socBar" style="width:0%;background:#66bb6a;"></div>
+  </div>
+</div>
+
 <div class="grid">
-  <div class="card"><h3>Tensao (V)</h3>     <canvas id="cV" height="160"></canvas></div>
-  <div class="card"><h3>Corrente (mA)</h3>  <canvas id="cI" height="160"></canvas></div>
-  <div class="card"><h3>Pack Total (V)</h3> <canvas id="cP" height="160"></canvas></div>
+  <div class="card"><h3>Tensao (V)</h3>    <canvas id="cV" height="160"></canvas></div>
+  <div class="card"><h3>Corrente (mA)</h3> <canvas id="cI" height="160"></canvas></div>
+  <div class="card"><h3>Pack Total (V)</h3><canvas id="cP" height="160"></canvas></div>
 </div>
 
 <script>
@@ -179,7 +226,7 @@ function barChart(id, data, minV, maxV) {
   cv.width = W; cv.height = 160;
   ctx.fillStyle = '#1e1e1e'; ctx.fillRect(0,0,W,160);
   var pad=32, top=14, bot=138;
-  var slots = 3, slotW = (W - pad) / slots;
+  var slotW = (W - pad) / 3;
   var barW  = Math.floor(slotW * 0.6);
   var range = (maxV - minV) || 1;
   for (var i = 0; i < 3; i++) {
@@ -232,6 +279,13 @@ function packChart(id, data) {
   }
 }
 
+function atualizarSoC(pct) {
+  document.getElementById('socPct').textContent = pct.toFixed(1) + '%';
+  var bar = document.getElementById('socBar');
+  bar.style.width = pct + '%';
+  bar.style.background = pct > 50 ? '#66bb6a' : pct > 20 ? '#ffb74d' : '#ef5350';
+}
+
 async function atualizar() {
   try {
     var r = await fetch('/dados');
@@ -241,6 +295,7 @@ async function atualizar() {
     barChart('cV', tv, Math.min.apply(null,tv)-0.1, Math.max.apply(null,tv)+0.1);
     barChart('cI', tc, Math.min(0,Math.min.apply(null,tc)), Math.max.apply(null,tc)+10);
     packChart('cP', tv);
+    atualizarSoC(d.soc);
     document.getElementById('temp').textContent = 'Temperatura do Pack: ' + d.temperatura.toFixed(1) + '°C';
     var st = document.getElementById('status');
     st.textContent = 'Sistema: ' + (d.ativo ? 'ATIVO' : 'CORTADO');
@@ -257,8 +312,15 @@ setInterval(atualizar, 1000);
 }
 
 void handleDados() {
-  String json = "{\"ativo\":" + String(sistemaAtivo ? "true" : "false")
+  float totalV = 0, totalI = 0;
+  for (int i = 0; i < 3; i++) {
+    totalV += leituras[i].tensao;
+    totalI += leituras[i].corrente;
+  }
+  String json = "{\"ativo\":"      + String(sistemaAtivo ? "true" : "false")
               + ",\"temperatura\":" + String(tempPack, 1)
+              + ",\"soc\":"         + String(soc, 1)
+              + ",\"totalV\":"      + String(totalV, 3)
               + ",\"baterias\":[";
   for (int i = 0; i < 3; i++) {
     json += "{\"id\":"       + String(i + 1)
@@ -267,9 +329,7 @@ void handleDados() {
           + "}";
     if (i < 2) json += ",";
   }
-  float totalV = 0;
-  for (int i = 0; i < 3; i++) totalV += leituras[i].tensao;
-  json += "],\"totalV\":" + String(totalV, 3) + "}";
+  json += "]}";
   server.send(200, "application/json", json);
 }
 
@@ -285,7 +345,7 @@ void setup() {
     digitalWrite(PINO_RELE[i], LOW);
   }
   pinMode(PINO_MOSFET, OUTPUT);
-  digitalWrite(PINO_MOSFET, HIGH); // carga ligada ao iniciar
+  digitalWrite(PINO_MOSFET, HIGH);
 
   for (int i = 0; i < 3; i++) {
     if (!sensores[i]->begin()) {
@@ -295,6 +355,14 @@ void setup() {
       Serial.printf("%s: iniciado!\n", nomes[i]);
     }
   }
+
+  // calibração inicial do SoC pela tensão média do pack
+  float tensaoMedia = 0;
+  for (int i = 0; i < 3; i++) tensaoMedia += sensores[i]->getBusVoltage();
+  tensaoMedia /= 3.0;
+  soc = tensaoParaSoC(tensaoMedia);
+  ultimoTempoSoC = millis();
+  Serial.printf("[SOC] Calibrado: %.1f%% (tensao media: %.3fV)\n", soc, tensaoMedia);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
@@ -316,11 +384,15 @@ void loop() {
   for (int i = 0; i < 3; i++) leituras[i] = medir(i);
   tempPack = lerTemperatura();
 
+  // Coulomb Counting com corrente total do pack
+  float correnteTotal = 0;
+  for (int i = 0; i < 3; i++) correnteTotal += leituras[i].corrente;
+  atualizarSoC(correnteTotal);
+
   if (sistemaAtivo) {
     verificarProtecoes();
     balancear();
   } else if (condicoesNormais()) {
-    // recuperação automática quando tudo voltar ao normal
     cortarSistema(false);
   }
 
@@ -329,7 +401,8 @@ void loop() {
     totalV += leituras[i].tensao;
     Serial.printf("[%s] %.3fV | %.1fmA\n", nomes[i], leituras[i].tensao, leituras[i].corrente);
   }
-  Serial.printf("[PACK] %.3fV | %.1fC | %s\n\n", totalV, tempPack, sistemaAtivo ? "ATIVO" : "CORTADO");
+  Serial.printf("[PACK] %.3fV | SoC: %.1f%% | %.1fC | %s\n\n",
+                totalV, soc, tempPack, sistemaAtivo ? "ATIVO" : "CORTADO");
 
   delay(500);
 }
